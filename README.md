@@ -1,6 +1,6 @@
-# SoundSmith
+# Audio Recording Console
 
-SoundSmith is a PyQt-based acoustic lab for designing, emitting, recording, and analyzing custom tactile/audio signatures. It wraps a live spectrum analyzer, a session-based recording pipeline, and a pluggable analysis/modeling framework into a single desktop app so you can build reproducible datasets for downstream robotics or ML work.
+Audio Recording Console is a PyQt-based acoustic lab for designing, emitting, recording, and analyzing custom tactile/audio signatures. It wraps a live spectrum analyzer, a session-based recording pipeline, and a pluggable analysis/modeling framework into a single desktop app so you can build reproducible datasets for downstream robotics or ML work.
 
 ## Features
 
@@ -14,7 +14,7 @@ SoundSmith is a PyQt-based acoustic lab for designing, emitting, recording, and 
 ## Repository Layout
 
 ```
-soundsmith_app/
+Audio Recording Console/
 ├── app.py                   # Main PyQt6 entry point
 ├── analyzers/               # Drop-in analyzer modules (auto-loaded)
 │   └── default_analyzers.py
@@ -52,7 +52,7 @@ pip install PyQt6 numpy scipy sounddevice matplotlib
 
 1. Activate your environment and start the GUI:
    ```bash
-   cd soundsmith_app
+   cd "Audio Recording Console"
    python app.py
    ```
 2. Select the desired input and output devices when prompted. These settings feed both the generator (`EmitterThread`) and analyzer (`AnalyzerThread`).
