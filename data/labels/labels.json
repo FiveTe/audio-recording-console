@@ -1,10 +1,19 @@
 {
     "ClosedPalm": "CP",
+    "ClosedPalm180": "CLOSEDPALM180",
+    "ClosedPalm90": "CLOSEDPALM90",
     "ClosedPalm_Horizontal": "CP_H",
     "GraspBook": "GB",
     "GraspBottle": "GBt",
     "OpenPalm": "OP",
+    "OpenPalm180": "OPENPALM180",
+    "OpenPalm90": "OPENPALM90",
     "OpenPalm_Horizontal": "OPENPALM_HORIZONTAL",
     "OpenPalm_Vertical": "OPENPALM_VERTICAL",
-    "PinchIndex": "PI"
+    "PinchIndex": "PI",
+    "PinchIndex180": "PINCHINDEX180",
+    "PinchIndex90": "PINCHINDEX90",
+    "PinchPinky": "PINCHPINKY",
+    "PinchPinky180": "PINCHPINKY180",
+    "PinchPinky90": "PINCHPINKY90"
 }

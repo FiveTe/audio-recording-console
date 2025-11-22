@@ -335,7 +335,7 @@ class EmitterThread(QThread):
     def _generate_high_energy_chirp(self):
         duration = RECORDING_DURATION_HIGH_ENERGY_S
         # Focus power where hand/bone response is strongest (mid-band region)
-        return self._generate_chirp(duration=duration, f0=300, f1=6000)
+        return self._generate_chirp(duration=6, f0=300, f1=6000)
 
     def audio_callback(self, outdata, frames, time, status):
         if self.is_muted:

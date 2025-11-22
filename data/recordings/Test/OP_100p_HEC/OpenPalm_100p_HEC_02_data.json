@@ -1031,6 +1031,6 @@
         -48.25022277306804,
         -47.655889594599756
     ],
-    "wav_path": "/home/sajad/Desktop/Uni/WS25/RoboticsProject/Audio Recording Console/data/recordings/Test/OP_100p_HEC/OpenPalm_100p_HEC_02.wav",
-    "spec_path": "/home/sajad/Desktop/Uni/WS25/RoboticsProject/Audio Recording Console/data/recordings/Test/OP_100p_HEC/OpenPalm_100p_HEC_02_spectrogram.png"
+    "wav_path": "/Users/sajadashraf/Desktop/Uni/WS25/Recording Console/audio-recording-console/data/recordings/Test/OP_100p_HEC/OpenPalm_100p_HEC_02.wav",
+    "spec_path": "/Users/sajadashraf/Desktop/Uni/WS25/Recording Console/audio-recording-console/data/recordings/Test/OP_100p_HEC/OpenPalm_100p_HEC_02_spectrogram.png"
 }
