@@ -2,6 +2,8 @@ import sys
 import json
 import os
 import glob
+import io
+import contextlib
 import numpy as np
 import sounddevice as sd
 from scipy.signal import butter, sosfilt, sosfilt_zi, chirp
@@ -12,9 +14,9 @@ from PyQt6.QtWidgets import (
     QSlider, QLabel, QPushButton, QLineEdit, QListWidget,
     QMessageBox, QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView,
     QInputDialog, QComboBox, QDialog, QSplitter, QScrollArea, QCheckBox,
-    QFrame, QSizePolicy, QListWidgetItem, QTreeWidget, QTreeWidgetItem
+    QFrame, QSizePolicy, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QTabWidget, QPlainTextEdit
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QDateTime
 from PyQt6.QtGui import QPixmap, QImage, QPainter
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -34,6 +36,7 @@ LABELS_DIR = os.path.join(DATA_DIR, "labels")
 LABELS_FILE = os.path.join(LABELS_DIR, "labels.json")
 ANALYZERS_DIR = os.path.join(APP_ROOT, "analyzers")
 MODELS_DIR = os.path.join(APP_ROOT, "models")
+LOOPBACK_FILE = os.path.join(DATA_DIR, "loopback_ref.npy")
 
 # =============================================================================
 # DYNAMIC MODULE REGISTRIES & DECORATORS
@@ -283,11 +286,14 @@ SAMPLING_RATE = 44100
 CHUNK_SIZE = 2048
 RECORDING_DURATION_PASSIVE_S = 10
 RECORDING_DURATION_ACTIVE_S = 6
+RECORDING_DURATION_HIGH_ENERGY_S = 12
+RECORDING_DURATION_H5_HEC_S = 6
 
 SOUND_TYPE_CODES = {
     "Sine Wave": "SIN",
     "Chirp": "CH",
     "5 Chirps": "5CH",
+    "High Energy Chirp": "HEC",
     "Passive": "PAS"
 }
 
@@ -316,6 +322,7 @@ class EmitterThread(QThread):
         self.is_muted = True
         self.chirp_buffer = self._generate_chirp(duration=1.0)
         self.five_chirps_buffer = self._generate_5_chirps()
+        self.high_energy_chirp_buffer = self._generate_high_energy_chirp()
 
     def _generate_chirp(self, duration=1.0, f0=20, f1=20000):
         t = np.linspace(0, duration, int(SAMPLING_RATE * duration), False)
@@ -324,6 +331,11 @@ class EmitterThread(QThread):
     def _generate_5_chirps(self):
         segment = np.concatenate([self._generate_chirp(duration=0.8), np.zeros(int(SAMPLING_RATE * 0.2))])
         return np.tile(segment, 5)
+
+    def _generate_high_energy_chirp(self):
+        duration = RECORDING_DURATION_HIGH_ENERGY_S
+        # Focus power where hand/bone response is strongest (mid-band region)
+        return self._generate_chirp(duration=duration, f0=300, f1=6000)
 
     def audio_callback(self, outdata, frames, time, status):
         if self.is_muted:
@@ -336,7 +348,12 @@ class EmitterThread(QThread):
             outdata[:] = wave.reshape(-1, 1)
             self.start_idx += frames
         else:
-            buffer = self.chirp_buffer if self.sound_type == "Chirp" else self.five_chirps_buffer
+            if self.sound_type == "High Energy Chirp":
+                buffer = self.high_energy_chirp_buffer
+            elif self.sound_type == "Chirp":
+                buffer = self.chirp_buffer
+            else:
+                buffer = self.five_chirps_buffer
             num_samples = len(buffer)
             start = self.start_idx % num_samples
             end = start + frames
@@ -365,6 +382,58 @@ class EmitterThread(QThread):
     def stop(self):
         self.is_running = False
 
+# =============================================================================
+# CORRUPTION MONITOR THREAD
+# =============================================================================
+class CorruptionMonitor(QThread):
+    status_update = pyqtSignal(str)
+
+    def __init__(self, analyzer_thread, interval_ms=500):
+        super().__init__()
+        self.analyzer_thread = analyzer_thread
+        self.interval_ms = interval_ms
+        self.is_running = True
+
+    def run(self):
+        while self.is_running:
+            chunk = getattr(self.analyzer_thread, "last_chunk", None)
+            if chunk is not None:
+                if not np.isfinite(chunk).all() or np.max(np.abs(chunk)) > 5:
+                    self.status_update.emit("Warning: Live chunk contains invalid samples.")
+                else:
+                    self.status_update.emit("")
+            self.msleep(self.interval_ms)
+
+    def stop(self):
+        self.is_running = False
+
+# =============================================================================
+# LOOPBACK CAPTURE THREAD
+# =============================================================================
+class LoopbackCaptureThread(QThread):
+    finished_capture = pyqtSignal(np.ndarray)
+    failed_capture = pyqtSignal(str)
+
+    def __init__(self, device_id, duration_s):
+        super().__init__()
+        self.device_id = device_id
+        self.duration_s = duration_s
+        self.is_running = True
+
+    def run(self):
+        try:
+            self.msleep(50)  # small delay to ensure device stable
+            rec = sd.rec(int(self.duration_s * SAMPLING_RATE), samplerate=SAMPLING_RATE, channels=1, device=self.device_id, dtype='float32')
+            sd.wait()
+            if not self.is_running:
+                return
+            ref = rec[:, 0]
+            self.finished_capture.emit(ref)
+        except Exception as e:
+            self.failed_capture.emit(str(e))
+
+    def stop(self):
+        self.is_running = False
 class AnalyzerThread(QThread):
     new_data = pyqtSignal(np.ndarray, np.ndarray, list)
     recording_finished = pyqtSignal(str, str, str, float, np.ndarray, np.ndarray) # session, label, sound_type, amp, ...
@@ -380,6 +449,9 @@ class AnalyzerThread(QThread):
         self.is_recording = False
         self.recording_buffer_fft = []
         self.recording_buffer_raw = []
+        self.last_chunk = None
+        self.reference_waveform = None
+        self.use_reference = False
 
     def audio_callback(self, indata, frames, time, status):
         raw_audio = indata[:, 0]
@@ -397,21 +469,24 @@ class AnalyzerThread(QThread):
         freq_bins = np.fft.rfftfreq(CHUNK_SIZE, 1 / SAMPLING_RATE)
         window = np.hanning(CHUNK_SIZE)
         while self.is_running:
-            if self.audio_queue:
-                data = self.audio_queue.pop(0)
-                if len(data) == CHUNK_SIZE:
-                    data_windowed = data * window
-                    db_magnitude = 20 * np.log10(np.abs(np.fft.rfft(data_windowed)) + 1e-9)
-                    if self.is_recording:
-                        self.recording_buffer_fft.append(db_magnitude)
-                    harmonics_data = []
-                    if self.fundamental_freq > 0:
-                        for i in range(1, 11):
-                            harmonic_freq = self.fundamental_freq * i
-                            if harmonic_freq < SAMPLING_RATE / 2:
-                                idx = np.argmin(np.abs(freq_bins - harmonic_freq))
-                                harmonics_data.append((freq_bins[idx], db_magnitude[idx]))
-                    self.new_data.emit(freq_bins, db_magnitude, harmonics_data)
+            if not self.audio_queue:
+                self.msleep(20)
+                continue
+            data = self.audio_queue.pop(0)
+            if len(data) == CHUNK_SIZE:
+                self.last_chunk = data
+                data_windowed = data * window
+                db_magnitude = 20 * np.log10(np.abs(np.fft.rfft(data_windowed)) + 1e-9)
+                if self.is_recording:
+                    self.recording_buffer_fft.append(db_magnitude)
+                harmonics_data = []
+                if self.fundamental_freq > 0:
+                    for i in range(1, 11):
+                        harmonic_freq = self.fundamental_freq * i
+                        if harmonic_freq < SAMPLING_RATE / 2:
+                            idx = np.argmin(np.abs(freq_bins - harmonic_freq))
+                            harmonics_data.append((freq_bins[idx], db_magnitude[idx]))
+                self.new_data.emit(freq_bins, db_magnitude, harmonics_data)
             self.msleep(20)
         stream.stop()
         stream.close()
@@ -436,6 +511,13 @@ class AnalyzerThread(QThread):
     def stop(self):
         self.is_running = False
 
+    def set_reference(self, ref_waveform):
+        if ref_waveform is not None and len(ref_waveform) > 0:
+            self.reference_waveform = ref_waveform.astype(np.float32).copy()
+
+    def set_use_reference(self, use_ref: bool):
+        self.use_reference = use_ref
+
 # =============================================================================
 # MODULAR ANALYZER DIALOG
 # =============================================================================
@@ -459,27 +541,30 @@ class ModularAnalyzerDialog(QDialog):
         control_layout.addWidget(QLabel("<b>1. Select Inputs:</b>"))
         self.input_list = QTreeWidget()
         self.input_list.setHeaderHidden(True)
+        self.input_list.itemChanged.connect(self.on_analyzer_item_changed)
         
-        # Group recordings by label
-        labels_map = {}
+        # Group recordings by session, then label
+        sessions_map = {}
         for uid, data in self.all_data.items():
+            session = data.get('session', 'Unassigned Session')
             label = data.get('label', 'Uncategorized')
-            if label not in labels_map:
-                labels_map[label] = []
-            labels_map[label].append(data)
+            sessions_map.setdefault(session, {}).setdefault(label, []).append(data)
             
-        # Populate the tree
-        for label in sorted(labels_map.keys()):
-            # Create top-level item for the label
-            label_item = QTreeWidgetItem(self.input_list, [label])
-            label_item.setFlags(label_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable) # Make label non-checkable
+        # Populate the tree: Session -> Label -> Recording
+        for session in sorted(sessions_map.keys()):
+            session_item = QTreeWidgetItem(self.input_list, [session])
+            session_item.setFlags(session_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
             
-            # Add recordings as children
-            for data in sorted(labels_map[label], key=lambda x: x['base_filename']):
-                child_item = QTreeWidgetItem(label_item, [data['base_filename']])
-                child_item.setData(0, Qt.ItemDataRole.UserRole, data['wav_path']) # Store UID (wav_path)
-                child_item.setFlags(child_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                child_item.setCheckState(0, Qt.CheckState.Unchecked)
+            for label in sorted(sessions_map[session].keys()):
+                label_item = QTreeWidgetItem(session_item, [label])
+                label_item.setFlags(label_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                label_item.setCheckState(0, Qt.CheckState.Unchecked)
+                
+                for data in sorted(sessions_map[session][label], key=lambda x: x['base_filename']):
+                    child_item = QTreeWidgetItem(label_item, [data['base_filename']])
+                    child_item.setData(0, Qt.ItemDataRole.UserRole, data['wav_path']) # Store UID (wav_path)
+                    child_item.setFlags(child_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    child_item.setCheckState(0, Qt.CheckState.Unchecked)
         
         self.input_list.expandAll() # Start with all groups open
         control_layout.addWidget(self.input_list)
@@ -502,9 +587,14 @@ class ModularAnalyzerDialog(QDialog):
         viewer_layout = QVBoxLayout(viewer_panel)
         viewer_layout.setContentsMargins(0, 0, 0, 0)
 
+        self.tabs = QTabWidget()
+
+        # --- Gallery Tab ---
+        gallery_widget = QWidget()
+        gallery_layout = QVBoxLayout(gallery_widget)
         self.main_view_container = QVBoxLayout()
         self.current_main_canvas = None
-        viewer_layout.addLayout(self.main_view_container, stretch=4)
+        gallery_layout.addLayout(self.main_view_container, stretch=4)
 
         self.thumb_scroll = QScrollArea()
         self.thumb_scroll.setFixedHeight(200)
@@ -513,22 +603,42 @@ class ModularAnalyzerDialog(QDialog):
         self.thumb_layout = QHBoxLayout(self.thumb_content)
         self.thumb_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.thumb_scroll.setWidget(self.thumb_content)
-        viewer_layout.addWidget(self.thumb_scroll, stretch=1)
+        gallery_layout.addWidget(self.thumb_scroll, stretch=1)
+
+        # --- Details Tab ---
+        self.details_scroll = QScrollArea()
+        self.details_scroll.setWidgetResizable(True)
+        self.details_container = QWidget()
+        self.details_layout = QVBoxLayout(self.details_container)
+        self.details_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.details_scroll.setWidget(self.details_container)
+
+        self.tabs.addTab(gallery_widget, "Gallery")
+        self.tabs.addTab(self.details_scroll, "Details")
+        viewer_layout.addWidget(self.tabs)
 
         main_layout.addWidget(viewer_panel)
 
     def run_analysis(self):
         selected_ids = []
         root = self.input_list.invisibleRootItem()
-        label_count = root.childCount()
+        session_count = root.childCount()
         
-        for i in range(label_count):
-            label_item = root.child(i)
-            recording_count = label_item.childCount()
-            for j in range(recording_count):
-                recording_item = label_item.child(j)
-                if recording_item.checkState(0) == Qt.CheckState.Checked:
-                    selected_ids.append(recording_item.data(0, Qt.ItemDataRole.UserRole))
+        for i in range(session_count):
+            session_item = root.child(i)
+            label_count = session_item.childCount()
+            for j in range(label_count):
+                label_item = session_item.child(j)
+                if label_item.checkState(0) == Qt.CheckState.Checked:
+                    for k in range(label_item.childCount()):
+                        rec_item = label_item.child(k)
+                        selected_ids.append(rec_item.data(0, Qt.ItemDataRole.UserRole))
+                    continue
+                recording_count = label_item.childCount()
+                for k in range(recording_count):
+                    recording_item = label_item.child(k)
+                    if recording_item.checkState(0) == Qt.CheckState.Checked:
+                        selected_ids.append(recording_item.data(0, Qt.ItemDataRole.UserRole))
         
         if not selected_ids:
              QMessageBox.warning(self, "Error", "Please select at least one input recording.")
@@ -542,6 +652,7 @@ class ModularAnalyzerDialog(QDialog):
         try:
             self.run_btn.setText("Running..."); self.run_btn.setEnabled(False); QApplication.processEvents()
             # Pass config globals to analyzer
+            self.last_selected_ids = list(selected_ids)
             self.current_results = analyzer_func(self.all_data, selected_ids, CHUNK_SIZE, SAMPLING_RATE)
             self.update_viewer()
         except Exception as e:
@@ -557,6 +668,11 @@ class ModularAnalyzerDialog(QDialog):
         
         while self.thumb_layout.count():
             item = self.thumb_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        # Clear details layout
+        while self.details_layout.count():
+            item = self.details_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
 
         if not self.current_results: return
@@ -583,6 +699,18 @@ class ModularAnalyzerDialog(QDialog):
             btn.clicked.connect(lambda checked, v=name: self.set_main_view(v))
             self.thumb_layout.addWidget(btn)
 
+            # Details view: full-size stacked canvases with titles
+            detail_box = QGroupBox(name)
+            detail_box_layout = QVBoxLayout()
+            detail_canvas = MplCanvas(figure=fig)
+            detail_canvas.draw()
+            detail_box_layout.addWidget(detail_canvas)
+            # Add a small info label
+            meta_text = f"Generated from {len(self.last_selected_ids) if hasattr(self, 'last_selected_ids') else 'N/A'} selected recordings."
+            detail_box_layout.addWidget(QLabel(meta_text))
+            detail_box.setLayout(detail_box_layout)
+            self.details_layout.addWidget(detail_box)
+
         if first_key:
             self.set_main_view(first_key)
 
@@ -597,6 +725,89 @@ class ModularAnalyzerDialog(QDialog):
             self.main_view_container.addWidget(self.current_main_canvas)
             self.current_main_canvas.draw()
 
+    def on_analyzer_item_changed(self, item, column):
+        # If a label item is toggled, propagate to its children
+        if item.childCount() > 0:
+            state = item.checkState(0)
+            for idx in range(item.childCount()):
+                child = item.child(idx)
+                child.setCheckState(0, state)
+
+# =============================================================================
+# TRAINING SELECTION DIALOG
+# =============================================================================
+class TrainingSelectionDialog(QDialog):
+    def __init__(self, recorded_signatures, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Selective Training")
+        self.setGeometry(200, 200, 600, 500)
+        self.all_data = recorded_signatures
+        self.initUI()
+
+    def initUI(self):
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Select recordings to include in training (Session → Label → Recording):"))
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.itemChanged.connect(self.on_item_changed)
+
+        sessions_map = {}
+        for uid, data in self.all_data.items():
+            session = data.get('session', 'Unassigned Session')
+            label = data.get('label', 'Uncategorized')
+            sessions_map.setdefault(session, {}).setdefault(label, []).append(data)
+
+        for session in sorted(sessions_map.keys()):
+            session_item = QTreeWidgetItem(self.tree, [session])
+            session_item.setFlags(session_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            for label in sorted(sessions_map[session].keys()):
+                label_item = QTreeWidgetItem(session_item, [label])
+                label_item.setFlags(label_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                label_item.setCheckState(0, Qt.CheckState.Unchecked)
+                for data in sorted(sessions_map[session][label], key=lambda x: x['base_filename']):
+                    child_item = QTreeWidgetItem(label_item, [data['base_filename']])
+                    child_item.setData(0, Qt.ItemDataRole.UserRole, data['wav_path'])
+                    child_item.setFlags(child_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    child_item.setCheckState(0, Qt.CheckState.Unchecked)
+
+        self.tree.expandAll()
+        layout.addWidget(self.tree)
+
+        btn_layout = QHBoxLayout()
+        self.run_btn = QPushButton("Train with Selection")
+        self.run_btn.clicked.connect(self.accept)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(self.run_btn)
+        btn_layout.addWidget(self.cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def selected_ids(self):
+        selected = []
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            session_item = root.child(i)
+            for j in range(session_item.childCount()):
+                label_item = session_item.child(j)
+                if label_item.checkState(0) == Qt.CheckState.Checked:
+                    for k in range(label_item.childCount()):
+                        rec_item = label_item.child(k)
+                        selected.append(rec_item.data(0, Qt.ItemDataRole.UserRole))
+                    continue
+                for k in range(label_item.childCount()):
+                    rec_item = label_item.child(k)
+                    if rec_item.checkState(0) == Qt.CheckState.Checked:
+                        selected.append(rec_item.data(0, Qt.ItemDataRole.UserRole))
+        return selected
+
+    def on_item_changed(self, item, column):
+        if item.childCount() > 0:
+            state = item.checkState(0)
+            for idx in range(item.childCount()):
+                child = item.child(idx)
+                child.setCheckState(0, state)
+
 # =============================================================================
 # MAIN APPLICATION WINDOW
 # =============================================================================
@@ -610,6 +821,9 @@ class MainWindow(QMainWindow):
         self.all_labels_map = load_labels()
         
         self.recorded_signatures = {} # Init empty, will be populated by scan
+        self.display_waveform = None  # waveform to show in UI (pending or last saved)
+        self.display_waveform_dirty = False
+        self.load_loopback_reference()
         
         self.latest_fft_data = None
         self.countdown_timer = QTimer(self)
@@ -623,7 +837,7 @@ class MainWindow(QMainWindow):
         self.recording_timer.timeout.connect(self.update_recording_countdown)
         self.recording_countdown_value = 0
         
-        self.is_current_recording_active = False
+        self.current_recording_mode = None
         self.pending_recording = None # For Save/Discard logic
         
         if not self.select_devices():
@@ -633,13 +847,18 @@ class MainWindow(QMainWindow):
         self.analyzer_thread = AnalyzerThread(self.input_device_id)
         self.analyzer_thread.new_data.connect(self.update_data)
         self.analyzer_thread.recording_finished.connect(self.handle_finished_recording)
+        self.corruption_monitor = CorruptionMonitor(self.analyzer_thread)
+        self.corruption_monitor.status_update.connect(self.on_corruption_status)
+        self.loopback_thread = None
 
         self.initUI() # Creates UI elements
+        self.refresh_device_lists() # Populate device combos based on current hardware and selection
         
         self.scan_and_load_recordings() # Populates UI lists from disk
         
         self.emitter_thread.start()
         self.analyzer_thread.start()
+        self.corruption_monitor.start()
 
     def select_devices(self):
         devices = sd.query_devices()
@@ -653,6 +872,19 @@ class MainWindow(QMainWindow):
         if ok1 and ok2:
             self.input_device_id = input_devices[input_name]
             self.output_device_id = output_devices[output_name]
+            # Adjust sampling rate to a value supported by both devices
+            try:
+                in_dev = sd.query_devices(self.input_device_id)
+                out_dev = sd.query_devices(self.output_device_id)
+                in_sr = in_dev.get("default_samplerate", 0) or 0
+                out_sr = out_dev.get("default_samplerate", 0) or 0
+                candidate_sr = int(min(in_sr, out_sr)) if in_sr and out_sr else int(max(in_sr, out_sr))
+                if candidate_sr > 0:
+                    global SAMPLING_RATE
+                    SAMPLING_RATE = candidate_sr
+                    print(f"Using sampling rate {SAMPLING_RATE} Hz (based on selected devices).")
+            except Exception as e:
+                print(f"Could not adjust sampling rate, keeping default {SAMPLING_RATE} Hz: {e}")
             return True
         return False
 
@@ -669,12 +901,52 @@ class MainWindow(QMainWindow):
         self.harmonics_table.setHorizontalHeaderLabels(["Frequency (Hz)", "Amplitude (dB)"])
         self.harmonics_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         harmonics_layout.addWidget(self.harmonics_table)
+
+        # Waveform comparison: live chunk vs last saved recording
+        self.waveform_compare_canvas = MplCanvas(self, width=5, height=2)
+        self.clean_signal_canvas = MplCanvas(self, width=5, height=2)
+        self.show_live_signal_chk = QCheckBox("Show live signal (loopback-removed)")
+        self.show_live_signal_chk.setChecked(False)  # default off for performance
+        harmonics_layout.addWidget(self.show_live_signal_chk)
+        harmonics_layout.addWidget(self.clean_signal_canvas)
+        harmonics_layout.addWidget(QLabel("Recording Preview"))
+        harmonics_layout.addWidget(self.waveform_compare_canvas)
+
         harmonics_box.setLayout(harmonics_layout)
         plot_and_harmonics_layout.addWidget(self.canvas)
         plot_and_harmonics_layout.addWidget(harmonics_box)
         main_layout.addLayout(plot_and_harmonics_layout)
 
         controls_layout = QVBoxLayout()
+
+        # --- Device Selection ---
+        devices_box = QGroupBox("🎧 Audio Devices")
+        devices_layout = QVBoxLayout()
+        input_dev_layout = QHBoxLayout()
+        input_dev_layout.addWidget(QLabel("Input:"))
+        self.input_device_combo = QComboBox()
+        input_dev_layout.addWidget(self.input_device_combo)
+        devices_layout.addLayout(input_dev_layout)
+
+        output_dev_layout = QHBoxLayout()
+        output_dev_layout.addWidget(QLabel("Output:"))
+        self.output_device_combo = QComboBox()
+        output_dev_layout.addWidget(self.output_device_combo)
+        devices_layout.addLayout(output_dev_layout)
+
+        dev_btn_layout = QHBoxLayout()
+        self.refresh_devices_btn = QPushButton("Refresh Devices")
+        self.refresh_devices_btn.clicked.connect(self.refresh_device_lists)
+        self.apply_devices_btn = QPushButton("Apply Devices")
+        self.apply_devices_btn.clicked.connect(self.apply_device_selection)
+        self.probe_rates_btn = QPushButton("Probe Sample Rates")
+        self.probe_rates_btn.clicked.connect(self.probe_sampling_rates)
+        dev_btn_layout.addWidget(self.refresh_devices_btn)
+        dev_btn_layout.addWidget(self.apply_devices_btn)
+        dev_btn_layout.addWidget(self.probe_rates_btn)
+        devices_layout.addLayout(dev_btn_layout)
+        devices_box.setLayout(devices_layout)
+        controls_layout.addWidget(devices_box)
         
         output_box = QGroupBox("🔊 Output Control")
         output_layout = QVBoxLayout()
@@ -698,10 +970,27 @@ class MainWindow(QMainWindow):
         sound_type_layout = QHBoxLayout()
         sound_type_layout.addWidget(QLabel("Sound Type:"))
         self.sound_type_combo = QComboBox()
-        self.sound_type_combo.addItems(["Sine Wave", "Chirp", "5 Chirps"])
+        self.sound_type_combo.addItems(["Sine Wave", "Chirp", "5 Chirps", "High Energy Chirp"])
         self.sound_type_combo.currentIndexChanged.connect(self.sound_type_changed)
         sound_type_layout.addWidget(self.sound_type_combo)
         output_layout.addLayout(sound_type_layout)
+
+        loopback_layout = QHBoxLayout()
+        self.capture_loopback_btn = QPushButton("Capture Loopback")
+        self.capture_loopback_btn.clicked.connect(self.capture_loopback_reference)
+        self.capture_loopback_full_btn = QPushButton("Record Loopback (12s)")
+        self.capture_loopback_full_btn.clicked.connect(lambda: self.capture_full_loopback(12))
+        self.capture_loopback_full6_btn = QPushButton("Record Loopback (6s)")
+        self.capture_loopback_full6_btn.clicked.connect(lambda: self.capture_full_loopback(6))
+        self.apply_loopback_chk = QCheckBox("Subtract loopback")
+        self.apply_loopback_chk.stateChanged.connect(self.toggle_loopback_subtraction)
+        self.apply_loopback_chk.setEnabled(False)
+        self.apply_loopback_chk.setToolTip("Loopback subtraction disabled; raw signal is used.")
+        loopback_layout.addWidget(self.capture_loopback_btn)
+        loopback_layout.addWidget(self.capture_loopback_full_btn)
+        loopback_layout.addWidget(self.capture_loopback_full6_btn)
+        loopback_layout.addWidget(self.apply_loopback_chk)
+        output_layout.addLayout(loopback_layout)
 
         self.freq_label = QLabel(f"Frequency: {self.emitter_thread.frequency:.0f} Hz")
         self.freq_slider = QSlider(Qt.Orientation.Horizontal)
@@ -771,8 +1060,14 @@ class MainWindow(QMainWindow):
         self.record_passive_button.clicked.connect(self.start_passive_recording)
         self.record_active_button = QPushButton("Record Active (5 Chirps)")
         self.record_active_button.clicked.connect(self.start_active_recording)
+        self.record_high_energy_button = QPushButton("Record High-Energy Chirp")
+        self.record_high_energy_button.clicked.connect(self.start_high_energy_recording)
+        self.record_hec6_button = QPushButton("Record HEC (6s)")
+        self.record_hec6_button.clicked.connect(self.start_hec6_recording)
         record_buttons_layout.addWidget(self.record_passive_button)
         record_buttons_layout.addWidget(self.record_active_button)
+        record_buttons_layout.addWidget(self.record_high_energy_button)
+        record_buttons_layout.addWidget(self.record_hec6_button)
         
         self.record_buttons_widget = QWidget()
         self.record_buttons_widget.setLayout(record_buttons_layout)
@@ -813,15 +1108,36 @@ class MainWindow(QMainWindow):
         record_box.setLayout(record_layout)
         
         train_box = QGroupBox("🧠 Train Model")
-        train_layout = QVBoxLayout()
+        train_tabs = QTabWidget()
+
+        # Controls tab
+        train_controls_widget = QWidget()
+        train_layout = QVBoxLayout(train_controls_widget)
         train_layout.addWidget(QLabel("<i>Select data above, then choose model type:</i>"))
         self.model_type_combo = QComboBox()
         self.model_type_combo.addItems(REGISTERED_MODELS.keys()) # Populated dynamically
         train_layout.addWidget(self.model_type_combo)
-        train_btn = QPushButton("Train New Model")
+        train_btn = QPushButton("Train All Data")
         train_btn.clicked.connect(self.run_model_training)
         train_layout.addWidget(train_btn)
-        train_box.setLayout(train_layout)
+        train_selected_btn = QPushButton("Train with Selection...")
+        train_selected_btn.clicked.connect(self.open_training_selection)
+        train_layout.addWidget(train_selected_btn)
+        train_layout.addStretch()
+
+        # Results tab
+        results_widget = QWidget()
+        results_layout = QVBoxLayout(results_widget)
+        self.training_output = QPlainTextEdit()
+        self.training_output.setReadOnly(True)
+        self.training_output.setMinimumHeight(180)
+        results_layout.addWidget(self.training_output)
+
+        train_tabs.addTab(train_controls_widget, "Controls")
+        train_tabs.addTab(results_widget, "Results")
+        box_layout = QVBoxLayout()
+        box_layout.addWidget(train_tabs)
+        train_box.setLayout(box_layout)
 
         controls_layout.addWidget(output_box)
         controls_layout.addWidget(record_box)
@@ -900,8 +1216,23 @@ class MainWindow(QMainWindow):
                     data = json.load(f)
                 
                 wav_path = data.get('wav_path')
+                base_filename = data.get('base_filename')
+                fixed_data = False
+
+                # Attempt to repair broken absolute paths by anchoring to the data file location
+                if (not wav_path or not os.path.exists(wav_path)) and base_filename:
+                    base_dir = os.path.dirname(data_path)
+                    candidate_wav = os.path.join(base_dir, f"{base_filename}.wav")
+                    candidate_spec = os.path.join(base_dir, f"{base_filename}_spectrogram.png")
+                    if os.path.exists(candidate_wav):
+                        wav_path = candidate_wav
+                        data["wav_path"] = wav_path
+                        if os.path.exists(candidate_spec):
+                            data["spec_path"] = candidate_spec
+                        fixed_data = True
+                
                 # Check if file exists and has all required data
-                if wav_path and data.get('base_filename') and os.path.exists(wav_path):
+                if wav_path and base_filename and os.path.exists(wav_path):
                     self.recorded_signatures[wav_path] = data
                     
                     label_full_name = data.get('label')
@@ -914,6 +1245,14 @@ class MainWindow(QMainWindow):
                             labels_updated = True
                     
                     loaded_count += 1
+
+                    # Persist repaired paths so future loads are fast
+                    if fixed_data:
+                        try:
+                            with open(data_path, 'w') as f:
+                                json.dump(data, f, indent=4)
+                        except Exception as e:
+                            print(f"Could not persist repaired paths for {data_path}: {e}")
                 else:
                     print(f"Skipping incomplete/missing data from {data_path}")
             except Exception as e:
@@ -960,12 +1299,18 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
 
     def start_passive_recording(self):
-        self._start_recording_flow(is_active=False)
+        self._start_recording_flow(mode="passive")
 
     def start_active_recording(self):
-        self._start_recording_flow(is_active=True)
+        self._start_recording_flow(mode="active")
 
-    def _start_recording_flow(self, is_active):
+    def start_high_energy_recording(self):
+        self._start_recording_flow(mode="high_energy")
+
+    def start_hec6_recording(self):
+        self._start_recording_flow(mode="hec6")
+
+    def _start_recording_flow(self, mode):
         session_name = self.session_combo.currentText().strip()
         label_full_name = self.label_combo.currentText().strip()
         
@@ -979,7 +1324,7 @@ class MainWindow(QMainWindow):
             
         self.current_session_name = session_name
         self.current_label_name = label_full_name
-        self.is_current_recording_active = is_active
+        self.current_recording_mode = mode
         self.was_playing_before_rec = not self.emitter_thread.is_muted
 
         self.record_buttons_widget.setEnabled(False)
@@ -1000,12 +1345,24 @@ class MainWindow(QMainWindow):
             self.begin_actual_recording()
 
     def begin_actual_recording(self):
-        if self.is_current_recording_active:
+        if self.current_recording_mode == "active":
             duration = RECORDING_DURATION_ACTIVE_S
             self.current_sound_type = "5 Chirps"
             self.current_rec_amplitude = self.emitter_thread.amplitude
             self.emitter_thread.set_sound_type("5 Chirps")
-            self.emitter_thread.set_muted(False) 
+            self.emitter_thread.set_muted(False)
+        elif self.current_recording_mode == "high_energy":
+            duration = RECORDING_DURATION_HIGH_ENERGY_S
+            self.current_sound_type = "High Energy Chirp"
+            self.current_rec_amplitude = self.emitter_thread.amplitude
+            self.emitter_thread.set_sound_type("High Energy Chirp")
+            self.emitter_thread.set_muted(False)
+        elif self.current_recording_mode == "hec6":
+            duration = RECORDING_DURATION_H5_HEC_S
+            self.current_sound_type = "High Energy Chirp"
+            self.current_rec_amplitude = self.emitter_thread.amplitude
+            self.emitter_thread.set_sound_type("High Energy Chirp")
+            self.emitter_thread.set_muted(False)
         else:
             duration = RECORDING_DURATION_PASSIVE_S
             self.current_sound_type = "Passive"
@@ -1024,6 +1381,10 @@ class MainWindow(QMainWindow):
     def finish_recording(self):
         self.recording_timer.stop() # Stop the countdown UI timer
         self.status_label.setText("Processing...")
+        # Stop output playback after capture to avoid continuous chirps
+        self.emitter_thread.set_muted(True)
+        self.play_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
         self.analyzer_thread.stop_and_process_recording(self.current_session_name, self.current_label_name, self.current_sound_type, self.current_rec_amplitude)
 
     def get_filepaths(self, session_name, full_label_name, label_abbr, sound_type, amplitude):
@@ -1066,6 +1427,9 @@ class MainWindow(QMainWindow):
             "averaged_spectrum": averaged_spectrum,
             "raw_audio": raw_audio
         }
+        # Prepare waveform display before save
+        self.display_waveform = raw_audio
+        self.display_waveform_dirty = True
         
         # Show confirmation buttons
         self.status_label.setText(f"Confirm: Save '{label_full_name}'?")
@@ -1120,6 +1484,8 @@ class MainWindow(QMainWindow):
 
         # Add to in-memory session
         self.recorded_signatures[wav_path] = data_for_storage
+        self.display_waveform = data["raw_audio"]
+        self.display_waveform_dirty = True
         
         # --- Add to Tree ---
         parent_item = None
@@ -1147,14 +1513,88 @@ class MainWindow(QMainWindow):
 
     def on_discard_pending_recording(self):
         self.pending_recording = None
+        self.display_waveform = None
+        self.display_waveform_dirty = False
         self.status_label.setText("Status: Recording discarded.")
         self._restore_ui_state()
+
+    def capture_loopback_reference(self):
+        chunk = getattr(self.analyzer_thread, "last_chunk", None)
+        if chunk is None:
+            QMessageBox.warning(self, "Loopback", "No audio chunk available to capture. Start stream first.")
+            return
+        self.analyzer_thread.set_reference(chunk)
+        # Persist to disk
+        try:
+            np.save(LOOPBACK_FILE, chunk.astype(np.float32))
+        except Exception as e:
+            print(f"Failed to save loopback reference: {e}")
+        self.status_label.setText("Status: Loopback reference captured.")
+
+    def capture_full_loopback(self, duration=12):
+        if self.loopback_thread and self.loopback_thread.isRunning():
+            QMessageBox.information(self, "Loopback", "Loopback capture already running.")
+            return
+        # Save current output state, then play HEC during capture
+        self._prev_sound_type = self.sound_type_combo.currentText()
+        self._prev_muted = self.emitter_thread.is_muted
+        self._prev_amp = self.emitter_thread.amplitude
+        self.emitter_thread.set_sound_type("High Energy Chirp")
+        self.emitter_thread.set_muted(False)
+        self.capture_loopback_full_btn.setEnabled(False)
+        self.capture_loopback_full6_btn.setEnabled(False)
+        self.status_label.setText(f"Status: Recording loopback ({duration}s)...")
+        self.loopback_thread = LoopbackCaptureThread(self.input_device_id, duration)
+        self.loopback_thread.finished_capture.connect(self._on_loopback_captured)
+        self.loopback_thread.failed_capture.connect(self._on_loopback_failed)
+        self.loopback_thread.start()
+
+    def toggle_loopback_subtraction(self, state):
+        # Loopback subtraction is disabled by design; keep checkbox inactive.
+        self.apply_loopback_chk.setChecked(False)
+        self.status_label.setText("Status: Loopback subtraction is disabled (using raw signal).")
+
+    def load_loopback_reference(self):
+        if os.path.exists(LOOPBACK_FILE):
+            try:
+                ref = np.load(LOOPBACK_FILE)
+                self.analyzer_thread.set_reference(ref)
+                print(f"Loaded loopback reference from {LOOPBACK_FILE}")
+            except Exception as e:
+                print(f"Could not load loopback reference: {e}")
+
+    def _on_loopback_captured(self, ref):
+        self.capture_loopback_full_btn.setEnabled(True)
+        self.capture_loopback_full6_btn.setEnabled(True)
+        # Restore output state
+        if hasattr(self, "_prev_sound_type"):
+            self.emitter_thread.set_sound_type(self._prev_sound_type)
+        if hasattr(self, "_prev_muted"):
+            self.emitter_thread.set_muted(self._prev_muted)
+        self.analyzer_thread.set_reference(ref)
+        try:
+            np.save(LOOPBACK_FILE, ref.astype(np.float32))
+        except Exception as e:
+            print(f"Failed to save loopback reference: {e}")
+        self.status_label.setText("Status: Full loopback (12s) captured.")
+        self.display_waveform = ref
+        self.display_waveform_dirty = True
+
+    def _on_loopback_failed(self, msg):
+        self.capture_loopback_full_btn.setEnabled(True)
+        self.capture_loopback_full6_btn.setEnabled(True)
+        if hasattr(self, "_prev_sound_type"):
+            self.emitter_thread.set_sound_type(self._prev_sound_type)
+        if hasattr(self, "_prev_muted"):
+            self.emitter_thread.set_muted(self._prev_muted)
+        self.status_label.setText(f"Status: Loopback capture failed: {msg}")
 
     def _restore_ui_state(self):
         # Show record buttons, hide confirm buttons
         self.confirm_buttons_widget.hide()
         self.record_buttons_widget.show()
         self.record_buttons_widget.setEnabled(True)
+        self.current_recording_mode = None
         
         # Restore play/stop state
         if self.was_playing_before_rec:
@@ -1188,10 +1628,184 @@ class MainWindow(QMainWindow):
             
         try:
             # Pass all recorded data to the model function
-            model_func(self.recorded_signatures)
+            self._run_model_with_logging(model_func, self.recorded_signatures, model_name)
             QMessageBox.information(self, "Training", f"Ran training for '{model_name}'. See console for output.")
         except Exception as e:
             QMessageBox.critical(self, "Model Error", f"{e.__class__.__name__}: {e}")
+            self._append_training_log(f"[ERROR] {model_name}: {e}")
+
+    def _append_training_log(self, text):
+        if hasattr(self, "training_output") and self.training_output is not None:
+            self.training_output.appendPlainText(text)
+
+    def _run_model_with_logging(self, model_func, data, model_name):
+        buf = io.StringIO()
+        timestamp = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            model_func(data)
+        output = buf.getvalue()
+        self._append_training_log(f"[{timestamp}] {model_name}\n{output}\n---")
+
+    # --- Device management helpers ---
+    def refresh_device_lists(self):
+        devices = sd.query_devices()
+        self.input_devices_map = {f"{i}: {d['name']}": i for i, d in enumerate(devices) if d['max_input_channels'] > 0}
+        self.output_devices_map = {f"{i}: {d['name']}": i for i, d in enumerate(devices) if d['max_output_channels'] > 0}
+
+        self.input_device_combo.blockSignals(True)
+        self.output_device_combo.blockSignals(True)
+        self.input_device_combo.clear()
+        self.output_device_combo.clear()
+        self.input_device_combo.addItems(self.input_devices_map.keys())
+        self.output_device_combo.addItems(self.output_devices_map.keys())
+
+        # Set current selections to active device ids if present
+        def set_current(combo, mapping, dev_id):
+            for text, idx in mapping.items():
+                if idx == dev_id:
+                    combo.setCurrentText(text)
+                    return
+        if hasattr(self, "input_device_id"):
+            set_current(self.input_device_combo, self.input_devices_map, self.input_device_id)
+        if hasattr(self, "output_device_id"):
+            set_current(self.output_device_combo, self.output_devices_map, self.output_device_id)
+        self.input_device_combo.blockSignals(False)
+        self.output_device_combo.blockSignals(False)
+
+    def apply_device_selection(self):
+        if getattr(self.analyzer_thread, "is_recording", False):
+            QMessageBox.warning(self, "Busy", "Stop recording before changing devices.")
+            return
+
+        in_text = self.input_device_combo.currentText()
+        out_text = self.output_device_combo.currentText()
+        if in_text not in getattr(self, "input_devices_map", {}) or out_text not in getattr(self, "output_devices_map", {}):
+            QMessageBox.warning(self, "Selection Error", "Please select valid input/output devices.")
+            return
+
+        new_in = self.input_devices_map[in_text]
+        new_out = self.output_devices_map[out_text]
+        if new_in == self.input_device_id and new_out == self.output_device_id:
+            self.status_label.setText("Status: Devices unchanged.")
+            return
+
+        # Find a mutually supported sample rate before stopping threads
+        supported_rate = self.pick_supported_rate(new_in, new_out)
+        if supported_rate is None:
+            QMessageBox.warning(self, "Sample Rate", "Could not find a common supported sample rate for the selected devices.")
+            return
+
+        # Stop existing threads with timeout to avoid UI freeze
+        self.emitter_thread.stop()
+        self.analyzer_thread.stop()
+        if not self.emitter_thread.wait(2000):
+            self.emitter_thread.terminate()
+        if not self.analyzer_thread.wait(2000):
+            self.analyzer_thread.terminate()
+
+        # Update IDs and recreate threads
+        self.input_device_id = new_in
+        self.output_device_id = new_out
+
+        # Set agreed sampling rate
+        global SAMPLING_RATE
+        SAMPLING_RATE = supported_rate
+        print(f"Using sampling rate {SAMPLING_RATE} Hz (based on selected devices).")
+
+        self.emitter_thread = EmitterThread(self.output_device_id)
+        self.analyzer_thread = AnalyzerThread(self.input_device_id)
+        self.analyzer_thread.new_data.connect(self.update_data)
+        self.analyzer_thread.recording_finished.connect(self.handle_finished_recording)
+
+        # Restore UI-selected sound parameters
+        self.emitter_thread.update_parameters(self.freq_slider.value(), self.amp_slider.value() / 100.0)
+        self.emitter_thread.set_sound_type(self.sound_type_combo.currentText())
+        if self.stop_button.isEnabled():  # was playing
+            self.emitter_thread.set_muted(False)
+        else:
+            self.emitter_thread.set_muted(True)
+
+        # Start new threads
+        self.emitter_thread.start()
+        self.analyzer_thread.start()
+
+        # Re-apply fundamental frequency if in sine mode
+        if self.sound_type_combo.currentText() == "Sine Wave":
+            self.analyzer_thread.set_fundamental_frequency(self.freq_slider.value())
+        else:
+            self.analyzer_thread.set_fundamental_frequency(0)
+
+        self.status_label.setText(f"Status: Devices applied (in {in_text}, out {out_text})")
+
+    def probe_sampling_rates(self):
+        in_text = self.input_device_combo.currentText()
+        out_text = self.output_device_combo.currentText()
+        if in_text not in getattr(self, "input_devices_map", {}) or out_text not in getattr(self, "output_devices_map", {}):
+            QMessageBox.warning(self, "Selection Error", "Please select valid input/output devices.")
+            return
+
+        in_id = self.input_devices_map[in_text]
+        out_id = self.output_devices_map[out_text]
+        candidate_rates = [44100, 48000, 32000, 22050, 96000, 192000]
+        ok_rates = []
+        for rate in candidate_rates:
+            try:
+                sd.check_input_settings(device=in_id, samplerate=rate, channels=1)
+                sd.check_output_settings(device=out_id, samplerate=rate, channels=1)
+                ok_rates.append(rate)
+            except Exception:
+                continue
+
+        if ok_rates:
+            msg = "Supported sample rates: " + ", ".join(f"{r} Hz" for r in ok_rates)
+            QMessageBox.information(self, "Sample Rates", msg)
+            self.status_label.setText(f"Status: Available rates: {ok_rates}")
+        else:
+            QMessageBox.warning(self, "Sample Rates", "No matching sample rates found in test list.")
+
+    def pick_supported_rate(self, in_id, out_id):
+        defaults = []
+        try:
+            defaults.append(int(sd.query_devices(in_id).get("default_samplerate", 0) or 0))
+            defaults.append(int(sd.query_devices(out_id).get("default_samplerate", 0) or 0))
+        except Exception:
+            pass
+        candidates = [r for r in defaults if r] + [48000, 44100, 96000, 192000, 32000, 22050]
+        seen = set()
+        unique_candidates = [r for r in candidates if not (r in seen or seen.add(r))]
+        for rate in unique_candidates:
+            try:
+                sd.check_input_settings(device=in_id, samplerate=rate, channels=1)
+                sd.check_output_settings(device=out_id, samplerate=rate, channels=1)
+                return rate
+            except Exception:
+                continue
+        return None
+
+    def open_training_selection(self):
+        if not self.recorded_signatures:
+            QMessageBox.information(self, "No Data", "Please record or load data before training.")
+            return
+
+        dialog = TrainingSelectionDialog(self.recorded_signatures, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            selected_ids = dialog.selected_ids()
+            if not selected_ids:
+                QMessageBox.warning(self, "No Selection", "Please select at least one recording.")
+                return
+
+            subset = {uid: self.recorded_signatures[uid] for uid in selected_ids if uid in self.recorded_signatures}
+            model_name = self.model_type_combo.currentText()
+            model_func = REGISTERED_MODELS.get(model_name)
+            if not model_func:
+                QMessageBox.critical(self, "Error", f"Could not find model function for '{model_name}'")
+                return
+            try:
+                self._run_model_with_logging(model_func, subset, model_name)
+                QMessageBox.information(self, "Training", f"Ran training for '{model_name}' on selected data. See console for output.")
+            except Exception as e:
+                QMessageBox.critical(self, "Model Error", f"{e.__class__.__name__}: {e}")
+                self._append_training_log(f"[ERROR] {model_name} (selection): {e}")
 
     def sound_type_changed(self):
         sound_type = self.sound_type_combo.currentText()
@@ -1236,11 +1850,46 @@ class MainWindow(QMainWindow):
                 self.harmonics_table.setItem(i, 0, QTableWidgetItem(f"{freq:.2f}"))
                 self.harmonics_table.setItem(i, 1, QTableWidgetItem(f"{amp:.2f}"))
 
+        # Current signal plot (loopback-removed)
+        if self.show_live_signal_chk.isChecked():
+            self.clean_signal_canvas.axes.clear()
+            last_chunk = getattr(self.analyzer_thread, "last_chunk", None)
+            if last_chunk is not None:
+                t = np.arange(len(last_chunk)) / SAMPLING_RATE
+                self.clean_signal_canvas.axes.plot(t, last_chunk, color="C1", alpha=0.8)
+                self.clean_signal_canvas.axes.set_title("Current Signal (loopback-removed)")
+                self.clean_signal_canvas.axes.set_xlabel("Time (s)")
+                self.clean_signal_canvas.axes.set_ylabel("Amplitude")
+                self.clean_signal_canvas.draw()
+
+        # --- Waveform comparison (only last saved recording to reduce UI load) ---
+        self.waveform_compare_canvas.axes.clear()
+        if self.display_waveform is not None and self.display_waveform_dirty:
+            N = min(len(self.display_waveform), SAMPLING_RATE // 2)
+            t_saved = np.arange(N) / SAMPLING_RATE
+            self.waveform_compare_canvas.axes.plot(t_saved, self.display_waveform[:N], label="Recording Preview", alpha=0.8)
+            self.waveform_compare_canvas.axes.legend()
+            self.waveform_compare_canvas.axes.set_title("Recording Preview")
+            self.waveform_compare_canvas.axes.set_xlabel("Time (s)")
+            self.waveform_compare_canvas.axes.set_ylabel("Amplitude")
+            self.waveform_compare_canvas.draw()
+            self.display_waveform_dirty = False
+
+    def on_corruption_status(self, message):
+        if message:
+            self.status_label.setText(f"Status: {message}")
+
     def closeEvent(self, event):
         self.emitter_thread.stop()
         self.analyzer_thread.stop()
+        self.corruption_monitor.stop()
+        if self.loopback_thread and self.loopback_thread.isRunning():
+            self.loopback_thread.stop()
         self.emitter_thread.wait()
         self.analyzer_thread.wait()
+        self.corruption_monitor.wait()
+        if self.loopback_thread:
+            self.loopback_thread.wait()
         event.accept()
 
 if __name__ == '__main__':

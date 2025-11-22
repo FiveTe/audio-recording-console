@@ -1,0 +1,10 @@
+{
+    "ClosedPalm": "CP",
+    "ClosedPalm_Horizontal": "CP_H",
+    "GraspBook": "GB",
+    "GraspBottle": "GBt",
+    "OpenPalm": "OP",
+    "OpenPalm_Horizontal": "OPENPALM_HORIZONTAL",
+    "OpenPalm_Vertical": "OPENPALM_VERTICAL",
+    "PinchIndex": "PI"
+}
